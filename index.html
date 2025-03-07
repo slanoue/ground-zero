@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ground Zero - Doom x Minecraft FPS</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #hud { position: absolute; top: 10px; left: 10px; color: white; font-family: Arial; }
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        }
+        #crosshair::before, #crosshair::after {
+            content: '';
+            position: absolute;
+            background: #ff0000;
+        }
+        #crosshair::before {
+            width: 1px;
+            height: 10px;
+            left: 4.5px;
+        }
+        #crosshair::after {
+            width: 10px;
+            height: 1px;
+            top: 4.5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">Player ID: <span id="playerId">Loading...</span> | Health: <span id="health">100</span></div>
+    <div id="crosshair"></div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script>
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const light = new THREE.DirectionalLight(0xffffff, 1);
+        light.position.set(10, 10, 10);
+        scene.add(light);
+
+        // Player setup
+        const playerGeometry = new THREE.BoxGeometry(1, 1, 1);
+        const playerMaterial = new THREE.MeshBasicMaterial({ color: Math.random() * 0xffffff });
+        const player = new THREE.Mesh(playerGeometry, playerMaterial);
+        camera.position.set(0, 5, 10);
+        camera.rotation.order = 'YXZ';
+
+        // Add first-person gun
+        const gunGeometry = new THREE.BoxGeometry(0.2, 0.2, 0.5);
+        const gunMaterial = new THREE.MeshBasicMaterial({ color: 0x000000 });
+        const gun = new THREE.Mesh(gunGeometry, gunMaterial);
+        const defaultGunPos = new THREE.Vector3(0.5, -0.5, -1);
+        gun.position.copy(defaultGunPos);
+        camera.add(gun);
+        scene.add(camera);
+
+        // Health and state
+        let health = 100;
+        let playerId;
+
+        // Jumping mechanics
+        let yVelocity = 0;
+        const gravity = -0.5;
+        const jumpStrength = 20; // Slightly higher than 18
+        const groundLevel = 5;
+
+        // Multiplayer via PeerJS
+        const peer = new Peer();
+        let connections = {}, otherPlayers = {};
+        peer.on('open', (id) => {
+            playerId = id;
+            document.getElementById('playerId').innerText = id.slice(0, 8);
+            document.getElementById('health').innerText = health;
+            connectToPeers();
+        });
+
+        // Procedurally generated arena
+        const groundGeometry = new THREE.BoxGeometry(100, 1, 100);
+        const groundMaterial = new THREE.MeshBasicMaterial({ color: 0x555555 });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.position.y = -0.5;
+        scene.add(ground);
+
+        for (let i = 0; i < 25; i++) {
+            const blockGeometry = new THREE.BoxGeometry(3, Math.random() * 4 + 1, 3);
+            const blockMaterial = new THREE.MeshBasicMaterial({ color: 0x8b4513 });
+            const block = new THREE.Mesh(blockGeometry, blockMaterial);
+            block.position.set(
+                Math.random() * 80 - 40,
+                blockGeometry.parameters.height / 2,
+                Math.random() * 80 - 40
+            );
+            scene.add(block);
+        }
+
+        // Shooting mechanics
+        const projectiles = [];
+        const muzzleFlashes = [];
+        let lastShot = 0;
+        function shoot() {
+            const now = Date.now();
+            if (now - lastShot < 200) return;
+            lastShot = now;
+
+            const projectileGeometry = new THREE.SphereGeometry(0.2, 8, 8);
+            const projectileMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+            const projectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
+            const gunWorldPos = new THREE.Vector3();
+            gun.getWorldPosition(gunWorldPos);
+            projectile.position.copy(gunWorldPos);
+            const direction = new THREE.Vector3();
+            camera.getWorldDirection(direction);
+            projectile.userData = { velocity: direction.clone().multiplyScalar(50), shooter: playerId };
+            scene.add(projectile);
+            projectiles.push(projectile);
+
+            const flashGeometry = new THREE.SphereGeometry(0.1, 8, 8);
+            const flashMaterial = new THREE.MeshBasicMaterial({ color: 0xffa500 });
+            const flash = new THREE.Mesh(flashGeometry, flashMaterial);
+            flash.position.set(0, 0, -0.3);
+            flash.userData = { lifetime: 0.15 };
+            gun.add(flash);
+            muzzleFlashes.push(flash);
+
+            gun.position.z += 0.2;
+            gun.position.y += 0.3;
+            gun.rotation.x += 1.221;
+
+            broadcast({
+                type: 'shoot',
+                x: projectile.position.x, y: projectile.position.y, z: projectile.position.z,
+                vx: projectile.userData.velocity.x, vy: projectile.userData.velocity.y, vz: projectile.userData.velocity.z,
+                shooter: playerId
+            });
+        }
+
+        function respawn() {
+            health = 100;
+            camera.position.set(Math.random() * 80 - 40, 5, Math.random() * 80 - 40);
+            yVelocity = 0;
+            document.getElementById('health').innerText = health;
+            document.getElementById('hud').innerText = `Player ID: ${playerId.slice(0, 8)} | Health: ${health} | Respawned!`;
+            setTimeout(() => {
+                document.getElementById('hud').innerText = `Player ID: ${playerId.slice(0, 8)} | Health: ${health}`;
+            }, 1000);
+            broadcast({ type: 'respawn', id: playerId, x: camera.position.x, y: camera.position.y - 5, z: camera.position.z });
+        }
+
+        const keys = {};
+        let isMouseDown = false;
+        document.addEventListener('keydown', (e) => {
+            keys[e.key] = true;
+            if (e.key === ' ' && camera.position.y <= groundLevel) {
+                yVelocity = jumpStrength;
+            }
+        });
+        document.addEventListener('keyup', (e) => keys[e.key] = false);
+        document.addEventListener('mousemove', (e) => {
+            camera.rotation.y -= e.movementX * 0.002;
+            camera.rotation.x -= e.movementY * 0.002;
+            camera.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.rotation.x));
+        });
+        document.addEventListener('mousedown', (e) => {
+            if (e.button === 0) isMouseDown = true;
+        });
+        document.addEventListener('mouseup', (e) => {
+            if (e.button === 0) isMouseDown = false;
+        });
+        document.body.requestPointerLock = document.body.requestPointerLock || document.body.mozRequestPointerLock;
+        document.addEventListener('click', () => document.body.requestPointerLock());
+
+        function connectToPeers() {
+            fetch('http://localhost:3000/peers')
+                .then(res => res.json())
+                .then(peers => {
+                    peers.forEach(id => {
+                        if (id !== playerId && !connections[id]) {
+                            const conn = peer.connect(id);
+                            setupConnection(conn);
+                        }
+                    });
+                });
+        }
+
+        function setupConnection(conn) {
+            conn.on('open', () => {
+                connections[conn.peer] = conn;
+                conn.on('data', handleData);
+            });
+        }
+
+        peer.on('connection', (conn) => {
+            setupConnection(conn);
+        });
+
+        function broadcast(data) {
+            Object.values(connections).forEach(conn => conn.send(data));
+        }
+
+        function handleData(data) {
+            if (data.type === 'position') {
+                if (!otherPlayers[data.id]) {
+                    const otherGeometry = new THREE.BoxGeometry(1, 1, 1);
+                    const otherMaterial = new THREE.MeshBasicMaterial({ color: Math.random() * 0xffffff });
+                    otherPlayers[data.id] = new THREE.Mesh(otherGeometry, otherMaterial);
+                    scene.add(otherPlayers[data.id]);
+                }
+                otherPlayers[data.id].position.set(data.x, data.y, data.z);
+            } else if (data.type === 'shoot') {
+                const projectileGeometry = new THREE.SphereGeometry(0.2, 8, 8);
+                const projectileMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+                const projectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
+                projectile.position.set(data.x, data.y, data.z);
+                projectile.userData = { velocity: new THREE.Vector3(data.vx, data.vy, data.vz), shooter: data.shooter };
+                scene.add(projectile);
+                projectiles.push(projectile);
+            } else if (data.type === 'hit' && data.target === playerId) {
+                health -= data.damage;
+                document.getElementById('health').innerText = health;
+                if (health <= 0) {
+                    respawn();
+                }
+            } else if (data.type === 'respawn') {
+                if (otherPlayers[data.id]) {
+                    otherPlayers[data.id].position.set(data.x, data.y, data.z);
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const speed = 0.2;
+            const direction = new THREE.Vector3();
+            camera.getWorldDirection(direction);
+            direction.y = 0;
+            direction.normalize();
+            if (keys['w']) camera.position.add(direction.clone().multiplyScalar(speed));
+            if (keys['s']) camera.position.sub(direction.clone().multiplyScalar(speed));
+            if (keys['a']) camera.position.sub(direction.clone().cross(new THREE.Vector3(0, 1, 0)).multiplyScalar(speed));
+            if (keys['d']) camera.position.add(direction.clone().cross(new THREE.Vector3(0, 1, 0)).multiplyScalar(speed));
+
+            yVelocity += gravity;
+            camera.position.y += yVelocity * 0.016;
+            if (camera.position.y <= groundLevel) {
+                camera.position.y = groundLevel;
+                yVelocity = 0;
+            }
+
+            if (isMouseDown) {
+                shoot();
+            }
+
+            projectiles.forEach((p, i) => {
+                p.position.add(p.userData.velocity.clone().multiplyScalar(0.016));
+                if (p.position.distanceTo(camera.position) < 1 && p.userData.shooter !== playerId) {
+                    health -= 20;
+                    document.getElementById('health').innerText = health;
+                    scene.remove(p);
+                    projectiles.splice(i, 1);
+                    if (health <= 0) {
+                        respawn();
+                    }
+                    return;
+                }
+                for (let id in otherPlayers) {
+                    if (p.position.distanceTo(otherPlayers[id].position) < 1 && p.userData.shooter !== id) {
+                        broadcast({ type: 'hit', target: id, damage: 20, shooter: playerId });
+                        scene.remove(p);
+                        projectiles.splice(i, 1);
+                        return;
+                    }
+                }
+                if (p.position.length() > 100 || Date.now() - lastShot > 5000) {
+                    scene.remove(p);
+                    projectiles.splice(i, 1);
+                }
+            });
+
+            muzzleFlashes.forEach((flash, i) => {
+                flash.userData.lifetime -= 0.016;
+                flash.scale.multiplyScalar(1.1);
+                flash.material.opacity = flash.userData.lifetime / 0.15;
+                if (flash.userData.lifetime <= 0) {
+                    gun.remove(flash);
+                    muzzleFlashes.splice(i, 1);
+                }
+            });
+
+            gun.position.lerp(defaultGunPos, 0.05);
+            gun.rotation.x += (0 - gun.rotation.x) * 0.05;
+
+            broadcast({ type: 'position', id: playerId, x: camera.position.x, y: camera.position.y - 5, z: camera.position.z });
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
